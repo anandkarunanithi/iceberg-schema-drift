@@ -1,0 +1,207 @@
+version: "3.9"
+
+networks:
+  iceberg-net:
+    driver: bridge
+
+services:
+
+  # ─────────────────────────────────────────
+  # Object Storage (S3-compatible)
+  # ─────────────────────────────────────────
+  minio:
+    image: minio/minio:RELEASE.2024-01-01T00-00-00Z
+    container_name: demo-minio
+    networks:
+      - iceberg-net
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # MinIO Console UI
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Creates the warehouse bucket on startup
+  minio-init:
+    image: minio/mc:latest
+    container_name: demo-minio-init
+    networks:
+      - iceberg-net
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh -c
+    command: >
+      "
+      mc alias set local http://minio:9000 minioadmin minioadmin123 &&
+      mc mb -p local/warehouse &&
+      mc mb -p local/checkpoints &&
+      echo 'Buckets created successfully'
+      "
+
+  # ─────────────────────────────────────────
+  # Iceberg Catalog (Nessie)
+  # ─────────────────────────────────────────
+  nessie:
+    image: projectnessie/nessie:0.76.0
+    container_name: demo-nessie
+    networks:
+      - iceberg-net
+    ports:
+      - "19120:19120"
+    environment:
+      QUARKUS_HTTP_PORT: 19120
+      NESSIE_VERSION_STORE_TYPE: IN_MEMORY
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:19120/api/v1/config"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ─────────────────────────────────────────
+  # Postgres (used by Alembic for relational
+  # migration tracking)
+  # ─────────────────────────────────────────
+  postgres:
+    image: postgres:16
+    container_name: demo-postgres
+    networks:
+      - iceberg-net
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d appdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────
+  # Alembic migration runner
+  # ─────────────────────────────────────────
+  alembic:
+    image: python:3.11-slim
+    container_name: demo-alembic
+    networks:
+      - iceberg-net
+    working_dir: /workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://app:app@postgres:5432/appdb
+    volumes:
+      - ./alembic:/workspace
+    command: >
+      /bin/sh -lc "
+      pip install --no-cache-dir -r requirements.txt &&
+      alembic upgrade head &&
+      echo 'Alembic migrations applied' &&
+      tail -f /dev/null
+      "
+
+  # ─────────────────────────────────────────
+  # Spark (schema evolution / DDL workaround)
+  # ─────────────────────────────────────────
+  spark:
+    image: apache/spark:3.5.1
+    container_name: demo-spark
+    networks:
+      - iceberg-net
+    depends_on:
+      nessie:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin123
+      AWS_REGION: us-east-1
+      SPARK_CONF_DIR: /opt/spark/conf
+    ports:
+      - "4040:4040"   # Spark UI
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf
+      - ./spark/sql:/workspace/sql
+      - ./jars:/opt/spark/jars/custom
+    command: /bin/bash -lc "tail -f /dev/null"
+    tty: true
+    stdin_open: true
+
+  # ─────────────────────────────────────────
+  # Flink Job Manager
+  # ─────────────────────────────────────────
+  flink-jobmanager:
+    image: apache/flink:1.18.1-scala_2.12-java17
+    container_name: demo-flink-jobmanager
+    networks:
+      - iceberg-net
+    depends_on:
+      nessie:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    command: jobmanager
+    ports:
+      - "8081:8081"   # Flink Web UI
+    environment:
+      JOB_MANAGER_RPC_ADDRESS: flink-jobmanager
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin123
+      AWS_REGION: us-east-1
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        state.backend: filesystem
+        state.checkpoints.dir: s3://checkpoints/flink
+        s3.endpoint: http://minio:9000
+        s3.path.style.access: true
+        s3.access-key: minioadmin
+        s3.secret-key: minioadmin123
+    volumes:
+      - ./flink/conf/flink-conf.yaml:/opt/flink/conf/flink-conf.yaml
+      - ./flink/sql:/workspace/sql
+      - ./jars:/opt/flink/lib/custom
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  # ─────────────────────────────────────────
+  # Flink Task Manager
+  # ─────────────────────────────────────────
+  flink-taskmanager:
+    image: apache/flink:1.18.1-scala_2.12-java17
+    container_name: demo-flink-taskmanager
+    networks:
+      - iceberg-net
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    command: taskmanager
+    environment:
+      JOB_MANAGER_RPC_ADDRESS: flink-jobmanager
+      TASK_MANAGER_NUMBER_OF_TASK_SLOTS: 4
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin123
+      AWS_REGION: us-east-1
+    volumes:
+      - ./flink/conf/flink-conf.yaml:/opt/flink/conf/flink-conf.yaml
+      - ./jars:/opt/flink/lib/custom
+
+volumes:
+  minio_data:
+  postgres_data:
